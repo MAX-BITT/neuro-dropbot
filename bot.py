@@ -13,6 +13,7 @@ import uuid
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -50,6 +51,46 @@ def _page_bounds(total: int, page: int, per_page: int) -> tuple[int, int, int]:
 
 def _nav_row(callbacks: list[tuple[str, str]]) -> list[InlineKeyboardButton]:
     return [InlineKeyboardButton(text=t, callback_data=d) for t, d in callbacks]
+
+
+async def _safe_edit(c: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
+    """Редактирует текущее сообщение вместо отправки нового.
+
+    Если контент не изменился — тихо игнорируем; если сообщение нельзя
+    отредактировать (старое / это фото) — отправляем новое как фолбэк.
+    """
+    msg = c.message
+    try:
+        if msg.text is not None:
+            await msg.edit_text(text, reply_markup=kb)
+        elif msg.caption is not None:  # сообщение-фото — правим подпись
+            await msg.edit_caption(caption=text, reply_markup=kb)
+        else:
+            await msg.answer(text, reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return
+        await msg.answer(text, reply_markup=kb)
+
+
+# ---------- тексты ----------
+WELCOME = (
+    "👋 <b>NeuroDrop — пополнение игр</b>\n\n"
+    "Здесь вы покупаете ключи пополнения игровой валюты быстро и по выгодной цене.\n"
+    "Оплата картой через ЮMoney — ключ приходит в этот чат <b>автоматически</b> "
+    "сразу после оплаты.\n\n"
+    "Что внутри:\n"
+    "• 🛒 <b>Каталог</b> — выберите игру и нужный номинал\n"
+    "• 🔑 <b>Мои ключи</b> — все ваши покупки и сами ключи\n"
+    "• ❓ <b>Поддержка</b> — поможем, если что-то пошло не так\n\n"
+    "Выберите раздел ниже 👇"
+)
+
+SUPPORT_TEXT = (
+    "❓ <b>Поддержка</b>\n\n"
+    "Если возник вопрос по оплате или ключу — напишите нам: @your_support_username\n\n"
+    "Подскажем по заказу, оплате и активации ключа."
+)
 
 
 # ---------- клавиатуры ----------
@@ -154,17 +195,13 @@ def product_kb(product_id: str, game: str, in_stock: bool) -> InlineKeyboardMark
 # ---------- меню/каталог ----------
 @dp.message(CommandStart())
 async def start(m: Message):
-    await m.answer(
-        "👋 Добро пожаловать в магазин цифровых ключей!\n\n"
-        "Выбирайте игру в каталоге — оплата картой через ЮMoney, "
-        "ключ приходит сразу после оплаты.",
-        reply_markup=main_menu(),
-    )
+    # пользователь написал /start — это новое сообщение (так и нужно)
+    await m.answer(WELCOME, reply_markup=main_menu())
 
 
 @dp.callback_query(F.data == "menu")
 async def cb_menu(c: CallbackQuery):
-    await c.message.edit_text("Главное меню:", reply_markup=main_menu())
+    await _safe_edit(c, WELCOME, main_menu())
     await c.answer()
 
 
@@ -175,15 +212,17 @@ async def cb_noop(c: CallbackQuery):
 
 @dp.callback_query(F.data == "support")
 async def cb_support(c: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Меню", callback_data="menu")]])
+    await _safe_edit(c, SUPPORT_TEXT, kb)
     await c.answer()
-    await c.message.answer("По вопросам пишите: @your_support_username")
 
 
 @dp.callback_query(F.data.startswith("g:"))
 async def cb_games(c: CallbackQuery):
     page = int(c.data.split(":", 1)[1] or 0)
     text, kb = await games_view(page)
-    await c.message.edit_text(text, reply_markup=kb)
+    await _safe_edit(c, text, kb)
     await c.answer()
 
 
@@ -191,7 +230,7 @@ async def cb_games(c: CallbackQuery):
 async def cb_tiers(c: CallbackQuery):
     _, page_s, game = c.data.split(":", 2)
     text, kb = await tiers_view(game, int(page_s or 0))
-    await c.message.edit_text(text, reply_markup=kb)
+    await _safe_edit(c, text, kb)
     await c.answer()
 
 
@@ -199,7 +238,7 @@ async def cb_tiers(c: CallbackQuery):
 async def cb_mykeys(c: CallbackQuery):
     page = int(c.data.split(":", 1)[1] or 0)
     text, kb = await mykeys_view(c.from_user.id, page)
-    await c.message.edit_text(text, reply_markup=kb)
+    await _safe_edit(c, text, kb)
     await c.answer()
 
 
@@ -213,20 +252,24 @@ async def cb_product(c: CallbackQuery):
     text = (f"<b>{p.title}</b>\n\n{p.description}\n\n"
             f"Цена: <b>{p.price}₽</b>\nВ наличии: {p.stock} шт.")
     kb = product_kb(p.id, p.game, p.stock > 0)
-    if p.image_url:
-        await c.message.answer_photo(p.image_url, caption=text, reply_markup=kb)
-    else:
-        await c.message.edit_text(text, reply_markup=kb)
+    await _safe_edit(c, text, kb)
     await c.answer()
 
 
 # ---------- покупка (ЮMoney QuickPay) ----------
 @dp.callback_query(F.data.startswith("buy:"))
-async def cb_buy(c: CallbackQuery, bot: Bot):
+async def cb_buy(c: CallbackQuery):
     pid = c.data.split(":", 1)[1]
     p = await sheets.get_product(pid)
-    if not p or p.stock <= 0:
+    if not p:
+        await c.answer("Товар не найден", show_alert=True)
+        text, kb = await games_view(0)
+        await _safe_edit(c, text, kb)
+        return
+    if p.stock <= 0:
         await c.answer("Товар закончился", show_alert=True)
+        text, kb = await tiers_view(p.game, 0)
+        await _safe_edit(c, text, kb)
         return
     if not config.ym_enabled:
         await c.answer("Оплата ещё не настроена (нет кошелька ЮMoney)", show_alert=True)
@@ -240,11 +283,9 @@ async def cb_buy(c: CallbackQuery, bot: Bot):
     # ключ не ушёл двум людям. Бронь держится config.reserve_ttl_min минут.
     key = await sheets.reserve_for_order(p.id, label, who)
     if not key:
-        await bot.send_message(
-            c.from_user.id,
-            "😔 Похоже, этот номинал только что закончился. "
-            "Загляните в каталог — возможно, есть другие.",
-        )
+        await c.answer("Этот номинал только что закончился", show_alert=True)
+        text, kb = await tiers_view(p.game, 0)
+        await _safe_edit(c, text, kb)
         return
 
     pay_url = ym.build_quickpay_url(
@@ -255,14 +296,40 @@ async def cb_buy(c: CallbackQuery, bot: Bot):
     )
     await orders.create_order(label, c.from_user.id, p.id, p.title, p.price)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить", url=pay_url)]])
-    await bot.send_message(
-        c.from_user.id,
+        [InlineKeyboardButton(text="💳 Оплатить", url=pay_url)],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data=f"x:{label}")],
+    ])
+    await _safe_edit(
+        c,
         f"🧾 Заказ: <b>{p.title}</b> — {p.price}₽\n\n"
         f"Ключ забронирован за вами на {config.reserve_ttl_min} мин. "
-        "Нажмите «Оплатить» — после оплаты ключ придёт сюда автоматически.",
-        reply_markup=kb,
+        "Нажмите «Оплатить» — после оплаты ключ придёт сюда автоматически.\n\n"
+        "Передумали? Нажмите «Отменить» — бронь снимется, ключ вернётся в наличие.",
+        kb,
     )
+
+
+@dp.callback_query(F.data.startswith("x:"))
+async def cb_cancel(c: CallbackQuery):
+    label = c.data.split(":", 1)[1]
+    order = await orders.get_order(label)
+    if not order or order["user_id"] != c.from_user.id:
+        await c.answer("Заказ не найден", show_alert=True)
+        return
+    if order["status"] == "paid" or order["key_issued"]:
+        await c.answer("Этот заказ уже оплачен", show_alert=True)
+        return
+
+    await sheets.release_order(label)               # снять бронь -> ключ снова свободен
+    await orders.set_status(label, "cancelled")
+
+    parsed = sheets.parse_product_id(order["product_id"])
+    if parsed:
+        text, kb = await tiers_view(parsed[0], 0)
+    else:
+        text, kb = await games_view(0)
+    await _safe_edit(c, "❌ Бронь отменена, ключ снова в наличии.\n\n" + text, kb)
+    await c.answer("Бронь отменена")
 
 
 # ---------- запуск ----------
