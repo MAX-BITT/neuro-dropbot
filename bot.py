@@ -35,29 +35,119 @@ log = logging.getLogger("neuro_dropbot")
 dp = Dispatcher()
 
 
+# ---------- пагинация ----------
+GAMES_PER_PAGE = 8     # игр на странице
+TIERS_PER_PAGE = 8     # номиналов на странице
+KEYS_PER_PAGE = 5      # «моих ключей» на странице
+
+
+def _page_bounds(total: int, page: int, per_page: int) -> tuple[int, int, int]:
+    """Возвращает (page, total_pages, offset) с зажатием page в допустимый диапазон."""
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    return page, total_pages, page * per_page
+
+
+def _nav_row(callbacks: list[tuple[str, str]]) -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text=t, callback_data=d) for t, d in callbacks]
+
+
 # ---------- клавиатуры ----------
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛒 Каталог", callback_data="catalog")],
+        [InlineKeyboardButton(text="🛒 Каталог", callback_data="g:0")],
+        [InlineKeyboardButton(text="🔑 Мои ключи", callback_data="mk:0")],
         [InlineKeyboardButton(text="❓ Поддержка", callback_data="support")],
     ])
 
 
-async def catalog_kb() -> InlineKeyboardMarkup:
-    rows = []
+async def _games() -> list[tuple[str, int, int]]:
+    """[(game, суммарный остаток, число номиналов)] по тем, у кого есть наличие."""
+    agg: dict[str, list[int]] = {}
     for p in await sheets.get_catalog():
-        mark = "" if p.stock > 0 else " (нет в наличии)"
+        g = agg.setdefault(p.game, [0, 0])
+        g[0] += p.stock
+        g[1] += 1
+    return [(name, s, t) for name, (s, t) in sorted(agg.items())]
+
+
+async def games_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    games = await _games()
+    page, total_pages, off = _page_bounds(len(games), page, GAMES_PER_PAGE)
+    rows = []
+    for name, stock, tiers in games[off:off + GAMES_PER_PAGE]:
         rows.append([InlineKeyboardButton(
-            text=f"{p.title} — {p.price}₽{mark}", callback_data=f"p:{p.id}")])
+            text=f"🎮 {name} · {stock} шт.", callback_data=f"t:0:{name}")])
+    nav = []
+    if page > 0:
+        nav.append(("◀️", f"g:{page - 1}"))
+    if total_pages > 1:
+        nav.append((f"{page + 1}/{total_pages}", "noop"))
+    if page < total_pages - 1:
+        nav.append(("▶️", f"g:{page + 1}"))
+    if nav:
+        rows.append(_nav_row(nav))
     rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    title = "🛒 Выберите игру:" if games else "🛒 Каталог пока пуст — загляните позже."
+    return title, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def product_kb(product_id: str, in_stock: bool) -> InlineKeyboardMarkup:
+async def tiers_view(game: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    tiers = [p for p in await sheets.get_catalog() if p.game == game]
+    tiers.sort(key=lambda p: p.qty)
+    page, total_pages, off = _page_bounds(len(tiers), page, TIERS_PER_PAGE)
+    rows = []
+    for p in tiers[off:off + TIERS_PER_PAGE]:
+        rows.append([InlineKeyboardButton(
+            text=f"{p.qty} — {p.price}₽ · {p.stock} шт.", callback_data=f"p:{p.id}")])
+    nav = []
+    if page > 0:
+        nav.append(("◀️", f"t:{page - 1}:{game}"))
+    if total_pages > 1:
+        nav.append((f"{page + 1}/{total_pages}", "noop"))
+    if page < total_pages - 1:
+        nav.append(("▶️", f"t:{page + 1}:{game}"))
+    if nav:
+        rows.append(_nav_row(nav))
+    rows.append([InlineKeyboardButton(text="⬅️ Игры", callback_data="g:0")])
+    title = (f"🎮 <b>{game}</b> — выберите номинал:"
+             if tiers else f"🎮 <b>{game}</b>: сейчас нет в наличии.")
+    return title, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def mykeys_view(user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    total = await orders.user_keys_count(user_id)
+    page, total_pages, off = _page_bounds(total, page, KEYS_PER_PAGE)
+    items = await orders.user_keys(user_id, KEYS_PER_PAGE, off)
+    if not items:
+        text = "🔑 У вас пока нет купленных ключей."
+    else:
+        lines = ["🔑 <b>Ваши ключи:</b>\n"]
+        for it in items:
+            lines.append(
+                f"• <b>{it['product_title']}</b> — {it['amount']}₽\n"
+                f"<code>{it['key_issued']}</code>\n"
+                f"<i>{it['created_at']}</i>\n")
+        text = "\n".join(lines)
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(("◀️", f"mk:{page - 1}"))
+    if total_pages > 1:
+        nav.append((f"{page + 1}/{total_pages}", "noop"))
+    if page < total_pages - 1:
+        nav.append(("▶️", f"mk:{page + 1}"))
+    if nav:
+        rows.append(_nav_row(nav))
+    rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def product_kb(product_id: str, game: str, in_stock: bool) -> InlineKeyboardMarkup:
     rows = []
     if in_stock:
         rows.append([InlineKeyboardButton(text="💳 Купить", callback_data=f"buy:{product_id}")])
-    rows.append([InlineKeyboardButton(text="⬅️ В каталог", callback_data="catalog")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"t:0:{game}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -66,7 +156,7 @@ def product_kb(product_id: str, in_stock: bool) -> InlineKeyboardMarkup:
 async def start(m: Message):
     await m.answer(
         "👋 Добро пожаловать в магазин цифровых ключей!\n\n"
-        "Выбирай товар в каталоге — оплата картой через ЮMoney, "
+        "Выбирайте игру в каталоге — оплата картой через ЮMoney, "
         "ключ приходит сразу после оплаты.",
         reply_markup=main_menu(),
     )
@@ -78,15 +168,38 @@ async def cb_menu(c: CallbackQuery):
     await c.answer()
 
 
+@dp.callback_query(F.data == "noop")
+async def cb_noop(c: CallbackQuery):
+    await c.answer()
+
+
 @dp.callback_query(F.data == "support")
 async def cb_support(c: CallbackQuery):
     await c.answer()
     await c.message.answer("По вопросам пишите: @your_support_username")
 
 
-@dp.callback_query(F.data == "catalog")
-async def cb_catalog(c: CallbackQuery):
-    await c.message.edit_text("Каталог товаров:", reply_markup=await catalog_kb())
+@dp.callback_query(F.data.startswith("g:"))
+async def cb_games(c: CallbackQuery):
+    page = int(c.data.split(":", 1)[1] or 0)
+    text, kb = await games_view(page)
+    await c.message.edit_text(text, reply_markup=kb)
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("t:"))
+async def cb_tiers(c: CallbackQuery):
+    _, page_s, game = c.data.split(":", 2)
+    text, kb = await tiers_view(game, int(page_s or 0))
+    await c.message.edit_text(text, reply_markup=kb)
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("mk:"))
+async def cb_mykeys(c: CallbackQuery):
+    page = int(c.data.split(":", 1)[1] or 0)
+    text, kb = await mykeys_view(c.from_user.id, page)
+    await c.message.edit_text(text, reply_markup=kb)
     await c.answer()
 
 
@@ -99,11 +212,11 @@ async def cb_product(c: CallbackQuery):
         return
     text = (f"<b>{p.title}</b>\n\n{p.description}\n\n"
             f"Цена: <b>{p.price}₽</b>\nВ наличии: {p.stock} шт.")
-    kb = product_kb(p.id, p.stock > 0)
+    kb = product_kb(p.id, p.game, p.stock > 0)
     if p.image_url:
         await c.message.answer_photo(p.image_url, caption=text, reply_markup=kb)
     else:
-        await c.message.answer(text, reply_markup=kb)
+        await c.message.edit_text(text, reply_markup=kb)
     await c.answer()
 
 

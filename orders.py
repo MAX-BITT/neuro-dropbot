@@ -89,6 +89,27 @@ def _set_status(label: str, status: str) -> None:
         c.execute("UPDATE orders SET status=? WHERE label=?", (status, label))
 
 
+def _user_keys(user_id: int, limit: int, offset: int) -> list[dict]:
+    """Выданные ключи пользователя (для раздела «Мои ключи»), новые сверху."""
+    with _connect() as c:
+        rows = c.execute(
+            "SELECT product_title, key_issued, amount, created_at FROM orders "
+            "WHERE user_id=? AND key_issued <> '' "
+            "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def _user_keys_count(user_id: int) -> int:
+    with _connect() as c:
+        r = c.execute(
+            "SELECT COUNT(*) AS n FROM orders WHERE user_id=? AND key_issued <> ''",
+            (user_id,),
+        ).fetchone()
+        return int(r["n"])
+
+
 # ---------- инвентарь ключей (бронь / продажа) ----------
 def _inv_expire() -> int:
     """Снимает просроченные брони — ключ снова считается свободным. Возвращает число."""
@@ -191,6 +212,14 @@ async def mark_issued(label: str, key: str, operation_id: str):
 
 async def set_status(label: str, status: str):
     await asyncio.to_thread(_set_status, label, status)
+
+
+async def user_keys(user_id: int, limit: int, offset: int) -> list[dict]:
+    return await asyncio.to_thread(_user_keys, user_id, limit, offset)
+
+
+async def user_keys_count(user_id: int) -> int:
+    return await asyncio.to_thread(_user_keys_count, user_id)
 
 
 # --- инвентарь: async-обёртки ---
