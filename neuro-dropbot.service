@@ -1,0 +1,15 @@
+[Unit]
+Description=Neuro_dropbot Telegram shop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/neuro-dropbot
+ExecStart=/opt/neuro-dropbot/.venv/bin/python /opt/neuro-dropbot/bot.py
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/neuro-dropbot/.env
+
+[Install]
+WantedBy=multi-user.target
