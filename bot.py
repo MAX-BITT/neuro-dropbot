@@ -166,8 +166,8 @@ async def main():
     await site.start()
     log.info("Web server on http://%s:%s (webhook %s)",
              config.web_host, config.web_port, config.webhook_path)
-    log.info("Bot starting. ym_enabled=%s sheets_enabled=%s webhook_url=%s",
-             config.ym_enabled, config.sheets_enabled,
+    log.info("Bot starting. ym_enabled=%s sheets_read=%s sheets_write=%s webhook_url=%s",
+             config.ym_enabled, config.sheets_readable, config.sheets_writable,
              config.webhook_url or "(no PUBLIC_BASE_URL)")
 
     try:

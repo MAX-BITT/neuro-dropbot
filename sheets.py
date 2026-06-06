@@ -139,8 +139,8 @@ def _client():
     return gspread.authorize(creds)
 
 
-def _scan_sheet() -> list[KeyCell]:
-    """Читает все игровые листы и возвращает все ключи priced-колонок."""
+def _scan_via_gspread() -> list[KeyCell]:
+    """Чтение через сервисный аккаунт (когда есть креды и нужна запись)."""
     gc = _client()
     sh = gc.open_by_key(config.sheet_id)
     skip = set(config.sheet_skip)
@@ -152,11 +152,65 @@ def _scan_sheet() -> list[KeyCell]:
     return cells
 
 
+def _scan_via_public() -> list[KeyCell]:
+    """Чтение по публичной ссылке (xlsx-экспорт) — без сервисного аккаунта.
+
+    Требует, чтобы таблица была открыта «Доступ по ссылке: читатель».
+    """
+    import io
+    import requests
+    import openpyxl
+
+    r = requests.get(config.sheet_export_xlsx_url, timeout=30,
+                     headers={"User-Agent": "Mozilla/5.0 (catalog-sync)"})
+    r.raise_for_status()
+    wb = openpyxl.load_workbook(io.BytesIO(r.content), data_only=True)
+    skip = set(config.sheet_skip)
+    cells: list[KeyCell] = []
+    for name in wb.sheetnames:
+        if name in skip:
+            continue
+        ws = wb[name]
+        values = [
+            [("" if v is None else str(v)) for v in row]
+            for row in ws.iter_rows(values_only=True)
+        ]
+        cells.extend(extract_cells(name, values))
+    return cells
+
+
+# короткий кэш прочитанной таблицы, чтобы не дёргать её на каждый клик
+_scan_cache: dict[str, object] = {"ts": 0.0, "cells": None}
+
+
+def _scan_sheet(force: bool = False) -> list[KeyCell]:
+    """Читает все игровые листы (с кэшем). Источник: креды -> gspread, иначе публичный xlsx."""
+    import time
+
+    now = time.time()
+    if (not force and _scan_cache["cells"] is not None
+            and now - float(_scan_cache["ts"]) < config.sheet_cache_sec):
+        return _scan_cache["cells"]  # type: ignore[return-value]
+
+    cells = _scan_via_gspread() if config.sheets_writable else _scan_via_public()
+    _scan_cache["cells"] = cells
+    _scan_cache["ts"] = now
+    return cells
+
+
 # ---------- каталог ----------
 def _catalog_sync() -> list[Product]:
-    if not config.sheets_enabled:
+    if not config.sheets_readable:
         return []
-    cells = _scan_sheet()
+    try:
+        cells = _scan_sheet()
+    except Exception as e:  # noqa: BLE001 — сеть/доступ к таблице не должны ронять бота
+        log.warning("sheets: не удалось прочитать таблицу: %r", e)
+        return []
+    return _build_catalog(cells)
+
+
+def _build_catalog(cells: list[KeyCell]) -> list[Product]:
     orders._inv_expire()              # снять просроченные брони
     blocked = orders._inv_blocked()   # {(game, key_text)} занятых ключей
 
@@ -188,9 +242,13 @@ def _catalog_sync() -> list[Product]:
 # ---------- бронь и продажа ----------
 def _reserve_sync(game: str, qty: int, order_label: str, buyer: str) -> str | None:
     """Берёт первый свободный ключ тарифа и бронирует его в БД. None — нет свободных."""
-    if not config.sheets_enabled:
+    if not config.sheets_readable:
         return None
-    cells = _scan_sheet()
+    try:
+        cells = _scan_sheet()
+    except Exception as e:  # noqa: BLE001
+        log.warning("sheets: чтение таблицы при брони не удалось: %r", e)
+        return None
     orders._inv_expire()
     blocked = orders._inv_blocked()
     ttl = config.reserve_ttl_min
@@ -216,7 +274,13 @@ def _reserve_sync(game: str, qty: int, order_label: str, buyer: str) -> str | No
 
 
 def _mark_cell_sold(game: str, row: int, col: int, key_text: str) -> None:
-    """Помечает ячейку проданной: серый фон, зачёркивание, метка ✅. Ключ сохраняется."""
+    """Помечает ячейку проданной: серый фон, зачёркивание, метка ✅. Ключ сохраняется.
+
+    Требует прав записи (сервисный аккаунт). При публичном чтении пропускается —
+    статус «продано» остаётся в БД.
+    """
+    if not config.sheets_writable:
+        return
     try:
         from gspread.utils import rowcol_to_a1
 
@@ -244,8 +308,8 @@ def _mark_cell_sold(game: str, row: int, col: int, key_text: str) -> None:
 
 
 def _confirm_sync(order_label: str, product_id_str: str, buyer: str) -> str | None:
-    """Оплата подтверждена: помечаем ключ sold (БД + лист) и возвращаем его."""
-    if not config.sheets_enabled:
+    """Оплата подтверждена: помечаем ключ sold (БД + лист, если есть права) и возвращаем его."""
+    if not config.sheets_readable:
         return None
 
     rec = orders._inv_confirm(order_label)
@@ -258,7 +322,11 @@ def _confirm_sync(order_label: str, product_id_str: str, buyer: str) -> str | No
     if not parsed:
         return None
     game, qty = parsed
-    cells = _scan_sheet()
+    try:
+        cells = _scan_sheet()
+    except Exception as e:  # noqa: BLE001
+        log.warning("sheets: чтение таблицы при подтверждении не удалось: %r", e)
+        return None
     orders._inv_expire()
     blocked = orders._inv_blocked()
     for c in sorted((c for c in cells if c.game == game and c.qty == qty),

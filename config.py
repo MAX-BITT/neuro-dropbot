@@ -46,6 +46,8 @@ class Config:
     )
     # Сколько минут держать бронь ключа после нажатия «Купить» до оплаты
     reserve_ttl_min: int = int(os.getenv("RESERVE_TTL_MIN", "15"))
+    # Сколько секунд кэшировать прочитанную таблицу (чтобы не дёргать её на каждый клик)
+    sheet_cache_sec: int = int(os.getenv("SHEET_CACHE_SEC", "20"))
 
     # --- Хранилище заказов ---
     db_path: str = os.getenv("DB_PATH", "/opt/neuro-dropbot/data/orders.db")
@@ -70,8 +72,23 @@ class Config:
         return bool(self.ym_wallet and self.ym_secret)
 
     @property
-    def sheets_enabled(self) -> bool:
+    def sheets_readable(self) -> bool:
+        """Можно читать каталог: либо по публичной ссылке, либо через креды."""
+        return bool(self.sheet_id)
+
+    @property
+    def sheets_writable(self) -> bool:
+        """Можно писать в таблицу (помечать проданные ячейки) — нужен сервисный аккаунт."""
         return bool(self.sheet_id and os.path.exists(self.google_credentials_file))
+
+    # Обратная совместимость
+    @property
+    def sheets_enabled(self) -> bool:
+        return self.sheets_readable
+
+    @property
+    def sheet_export_xlsx_url(self) -> str:
+        return f"https://docs.google.com/spreadsheets/d/{self.sheet_id}/export?format=xlsx"
 
 
 config = Config()
