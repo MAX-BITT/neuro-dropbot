@@ -37,6 +37,15 @@ class Config:
     )
     sheet_catalog: str = os.getenv("SHEET_CATALOG", "Каталог")
     sheet_keys: str = os.getenv("SHEET_KEYS", "Ключи")
+    # Листы, которые не являются играми и не парсятся в каталог
+    sheet_skip: list[str] = field(
+        default_factory=lambda: [
+            s.strip() for s in os.getenv("SHEET_SKIP", "Логи,Настройки,Продажи").split(",")
+            if s.strip()
+        ]
+    )
+    # Сколько минут держать бронь ключа после нажатия «Купить» до оплаты
+    reserve_ttl_min: int = int(os.getenv("RESERVE_TTL_MIN", "15"))
 
     # --- Хранилище заказов ---
     db_path: str = os.getenv("DB_PATH", "/opt/neuro-dropbot/data/orders.db")

@@ -122,6 +122,18 @@ async def cb_buy(c: CallbackQuery, bot: Bot):
 
     label = f"{c.from_user.id}-{p.id}-{uuid.uuid4().hex[:8]}"
     who = f"@{c.from_user.username}" if c.from_user.username else str(c.from_user.id)
+
+    # Бронируем ключ ДО оплаты, чтобы при одновременных покупках один и тот же
+    # ключ не ушёл двум людям. Бронь держится config.reserve_ttl_min минут.
+    key = await sheets.reserve_for_order(p.id, label, who)
+    if not key:
+        await bot.send_message(
+            c.from_user.id,
+            "😔 Похоже, этот номинал только что закончился. "
+            "Загляните в каталог — возможно, есть другие.",
+        )
+        return
+
     pay_url = ym.build_quickpay_url(
         label=label,
         amount_rub=float(p.price),
@@ -134,7 +146,8 @@ async def cb_buy(c: CallbackQuery, bot: Bot):
     await bot.send_message(
         c.from_user.id,
         f"🧾 Заказ: <b>{p.title}</b> — {p.price}₽\n\n"
-        "Нажмите «Оплатить». После оплаты ключ придёт сюда автоматически.",
+        f"Ключ забронирован за вами на {config.reserve_ttl_min} мин. "
+        "Нажмите «Оплатить» — после оплаты ключ придёт сюда автоматически.",
         reply_markup=kb,
     )
 

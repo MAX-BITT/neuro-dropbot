@@ -1,34 +1,133 @@
 """Слой данных: каталог и выдача ключей из Google Sheets.
 
-Новая структура таблицы:
-  Каждый лист = игра (например, ROBLOX)
-  Заголовки: количество_валюты цена (например, "100 100", "296 200")
-  Строки: ключи
-  
-  Добавляем колонки справа: Статус | Покупатель | Дата
-  Статус: free / sold
+Структура таблицы:
+  Каждый лист = игра (например, ROBLOX).
+  Строка 1 — заголовки колонок вида "<количество_валюты> <цена>", например
+  "100 100" (100 единиц за 100₽) или "296 200". Колонка без второго числа
+  (например "450", "600") — цена не задана, такой тариф НЕ продаётся.
+  Ниже заголовка в той же колонке лежат ключи — по одному в ячейке.
+  Колонка "№" и листы из config.sheet_skip игнорируются.
+
+Состояние «занято» (бронь/продано) хранится НЕ в листе, а в БД
+(orders.inventory_keys) — это слой переопределения. Лист отвечает на вопрос
+«какие ключи вообще есть и где», БД — «какие уже заняты». При продаже ячейка
+в листе дополнительно помечается визуально (серый фон, зачёркнутый текст, ✅),
+но ключ не удаляется.
+
+Пока таблица не подключена (нет SHEET_ID / service_account.json) — каталог
+пустой, бот запускается и показывает интерфейс без товаров.
 """
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import logging
+import re
 from dataclasses import dataclass
 
+import orders
 from config import config
 
-_key_lock = asyncio.Lock()
+log = logging.getLogger("neuro_dropbot.sheets")
+
+# Гарантирует, что бронь (read-sheet -> insert) выполняется по одному за раз
+_reserve_lock = asyncio.Lock()
+
+# Метка проданного ключа, дописываемая в ячейку (ключ при этом сохраняется)
+SOLD_MARK = " ✅"
+_PRODUCT_ID_SEP = "__"
 
 
 @dataclass
 class Product:
-    id: str
+    id: str          # "<game>__<qty>", например "ROBLOX__100"
     title: str
     description: str
-    price: int
+    price: int       # рублей, целое
     image_url: str = ""
     stock: int = 0
+    game: str = ""
+    qty: int = 0
 
 
+@dataclass
+class KeyCell:
+    game: str
+    qty: int
+    price: int
+    row: int         # 1-based, как в Google Sheets
+    col: int         # 1-based
+    key_text: str
+
+
+# ---------- разбор таблицы (чистые функции, тестируются офлайн) ----------
+def parse_header(header: str) -> tuple[int, int] | None:
+    """'100 100' -> (qty=100, price=100). Без второго числа -> None (тариф без цены)."""
+    parts = header.strip().split()
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def clean_key(raw: str) -> str:
+    """Каноничный текст ключа: без хвостовой метки продажи и пробелов."""
+    val = raw.strip()
+    mark = SOLD_MARK.strip()
+    if mark and val.endswith(mark):
+        val = val[: -len(mark)].strip()
+    return val
+
+
+_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{3,}$")
+
+
+def _looks_like_key(val: str) -> bool:
+    return bool(_KEY_RE.match(val))
+
+
+def extract_cells(game: str, values: list[list[str]]) -> list[KeyCell]:
+    """Из матрицы значений листа достаёт все ключи priced-колонок."""
+    if not values:
+        return []
+    header = values[0]
+    tiers: dict[int, tuple[int, int]] = {}
+    for col_idx, h in enumerate(header):
+        parsed = parse_header(str(h))
+        if parsed:
+            tiers[col_idx] = parsed
+
+    cells: list[KeyCell] = []
+    for r in range(1, len(values)):
+        row = values[r]
+        for col_idx, (qty, price) in tiers.items():
+            if col_idx >= len(row):
+                continue
+            key = clean_key(str(row[col_idx]))
+            if not key or not _looks_like_key(key):
+                continue
+            cells.append(KeyCell(game=game, qty=qty, price=price,
+                                 row=r + 1, col=col_idx + 1, key_text=key))
+    return cells
+
+
+def product_id(game: str, qty: int) -> str:
+    return f"{game}{_PRODUCT_ID_SEP}{qty}"
+
+
+def parse_product_id(pid: str) -> tuple[str, int] | None:
+    if _PRODUCT_ID_SEP not in pid:
+        return None
+    game, qty = pid.rsplit(_PRODUCT_ID_SEP, 1)
+    try:
+        return game, int(qty)
+    except ValueError:
+        return None
+
+
+# ---------- доступ к Google Sheets ----------
 def _client():
     import gspread
     from google.oauth2.service_account import Credentials
@@ -40,201 +139,168 @@ def _client():
     return gspread.authorize(creds)
 
 
-def _parse_header(header: str) -> tuple[int, int] | None:
-    """Парсит заголовок типа 100 100 -> (количество=100, цена=100)"""
-    parts = header.strip().split()
-    if len(parts) >= 2:
-        try:
-            qty = int(parts[0])
-            price = int(parts[1])
-            return qty, price
-        except ValueError:
-            pass
-    return None
+def _scan_sheet() -> list[KeyCell]:
+    """Читает все игровые листы и возвращает все ключи priced-колонок."""
+    gc = _client()
+    sh = gc.open_by_key(config.sheet_id)
+    skip = set(config.sheet_skip)
+    cells: list[KeyCell] = []
+    for ws in sh.worksheets():
+        if ws.title in skip:
+            continue
+        cells.extend(extract_cells(ws.title, ws.get_all_values()))
+    return cells
 
 
-def _ensure_status_columns(ws, header_row):
-    """Добавляет колонки Статус, Покупатель, Дата если их нет"""
-    required = ["Статус", "Покупатель", "Дата"]
-    existing = [h.strip() for h in header_row]
-    cols_to_add = []
-    for col in required:
-        if col not in existing:
-            cols_to_add.append(col)
-    if cols_to_add:
-        next_col = len(existing) + 1
-        for i, col in enumerate(cols_to_add):
-            ws.update_cell(1, next_col + i, col)
-        return ws.row_values(1)
-    return header_row
-
-
+# ---------- каталог ----------
 def _catalog_sync() -> list[Product]:
     if not config.sheets_enabled:
         return []
-    
-    gc = _client()
-    sh = gc.open_by_key(config.sheet_id)
-    
-    products = []
-    for ws in sh.worksheets():
-        sheet_name = ws.title
-        if sheet_name in ("Логи", "Настройки"):
+    cells = _scan_sheet()
+    orders._inv_expire()              # снять просроченные брони
+    blocked = orders._inv_blocked()   # {(game, key_text)} занятых ключей
+
+    # агрегируем свободные по (game, qty) -> [price, count]
+    agg: dict[tuple[str, int], list[int]] = {}
+    for c in cells:
+        if (c.game, c.key_text) in blocked:
             continue
-            
-        all_values = ws.get_all_values()
-        if not all_values:
-            continue
-            
-        header_row = all_values[0]
-        header_row = _ensure_status_columns(ws, header_row)
-        
-        # Индексы колонок
-        status_idx = None
-        buyer_idx = None
-        for i, h in enumerate(header_row):
-            h_stripped = h.strip()
-            if h_stripped == "Статус":
-                status_idx = i
-            elif h_stripped == "Покупатель":
-                buyer_idx = i
-        
-        # Считаем свободные ключи по каждому заголовку
-        for col_idx, header in enumerate(header_row):
-            parsed = _parse_header(header)
-            if not parsed:
-                continue
-                
-            qty, price = parsed
-            free_count = 0
-            
-            for row_idx in range(1, len(all_values)):
-                row = all_values[row_idx]
-                if col_idx >= len(row):
-                    continue
-                key_val = row[col_idx].strip()
-                if not key_val:
-                    continue
-                    
-                # Проверяем статус если есть колонка
-                if status_idx is not None and status_idx < len(row):
-                    status = row[status_idx].strip().lower()
-                    if status and status not in ("free", "свободен", ""):
-                        continue
-                
-                free_count += 1
-            
-            if free_count > 0:
-                product_id = f"{sheet_name}_{qty}"
-                products.append(Product(
-                    id=product_id,
-                    title=f"{sheet_name} {qty} единиц",
-                    description=f"Ключ для {sheet_name} — {qty} единиц валюты",
-                    price=price,
-                    image_url="",
-                    stock=free_count,
-                ))
-    
+        key = (c.game, c.qty)
+        if key not in agg:
+            agg[key] = [c.price, 0]
+        agg[key][1] += 1
+
+    products: list[Product] = []
+    for (game, qty), (price, stock) in sorted(agg.items(), key=lambda x: (x[0][0], x[0][1])):
+        products.append(Product(
+            id=product_id(game, qty),
+            title=f"{game} — {qty}",
+            description=f"{qty} ед. игровой валюты {game}.",
+            price=price,
+            image_url="",
+            stock=stock,
+            game=game,
+            qty=qty,
+        ))
     return products
 
 
-def _reserve_sync(product_title: str, buyer: str) -> str | None:
-    """Находит первый свободный ключ, помечает sold, возвращает его."""
+# ---------- бронь и продажа ----------
+def _reserve_sync(game: str, qty: int, order_label: str, buyer: str) -> str | None:
+    """Берёт первый свободный ключ тарифа и бронирует его в БД. None — нет свободных."""
     if not config.sheets_enabled:
         return None
-        
-    gc = _client()
-    sh = gc.open_by_key(config.sheet_id)
-    
-    # Парсим product_title: "ROBLOX 100 единиц" -> sheet_name="ROBLOX", qty=100
-    parts = product_title.split()
-    if len(parts) < 2:
-        return None
-    
-    sheet_name = parts[0]
-    try:
-        target_qty = int(parts[1])
-    except ValueError:
-        return None
-    
-    ws = sh.worksheet(sheet_name)
-    all_values = ws.get_all_values()
-    if not all_values:
-        return None
-        
-    header_row = all_values[0]
-    header_row = _ensure_status_columns(ws, header_row)
-    
-    # Находим колонку с нужным количеством
-    target_col = None
-    for i, h in enumerate(header_row):
-        parsed = _parse_header(h)
-        if parsed and parsed[0] == target_qty:
-            target_col = i
-            break
-    
-    if target_col is None:
-        return None
-    
-    # Индексы колонок статуса
-    status_idx = None
-    buyer_idx = None
-    date_idx = None
-    for i, h in enumerate(header_row):
-        h_stripped = h.strip()
-        if h_stripped == "Статус":
-            status_idx = i
-        elif h_stripped == "Покупатель":
-            buyer_idx = i
-        elif h_stripped == "Дата":
-            date_idx = i
-    
-    # Ищем первый свободный ключ
-    for row_idx in range(1, len(all_values)):
-        row = all_values[row_idx]
-        if target_col >= len(row):
+    cells = _scan_sheet()
+    orders._inv_expire()
+    blocked = orders._inv_blocked()
+    ttl = config.reserve_ttl_min
+    reserved_until = (dt.datetime.utcnow() + dt.timedelta(minutes=ttl)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    # стабильный порядок: по строке -> детерминированно берём «верхний» ключ
+    candidates = sorted(
+        (c for c in cells if c.game == game and c.qty == qty), key=lambda c: c.row
+    )
+    for c in candidates:
+        if (c.game, c.key_text) in blocked:
             continue
-        key_val = row[target_col].strip()
-        if not key_val:
-            continue
-            
-        # Проверяем статус
-        if status_idx is not None and status_idx < len(row):
-            status = row[status_idx].strip().lower()
-            if status and status not in ("free", "свободен", ""):
-                continue
-        
-        # Помечаем как sold
-        import gspread
-        now_str = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-        updates = []
-        if status_idx is not None:
-            updates.append(gspread.Cell(row_idx + 1, status_idx + 1, "sold"))
-        if buyer_idx is not None:
-            updates.append(gspread.Cell(row_idx + 1, buyer_idx + 1, buyer))
-        if date_idx is not None:
-            updates.append(gspread.Cell(row_idx + 1, date_idx + 1, now_str))
-        
-        if updates:
-            ws.update_cells(updates)
-        
-        return key_val
-    
+        ok = orders._inv_reserve(
+            c.game, c.key_text, c.qty, c.price, c.row, c.col,
+            buyer, order_label, reserved_until,
+        )
+        if ok:
+            return c.key_text
+        # проиграли гонку за этот ключ — пробуем следующий
+        blocked.add((c.game, c.key_text))
     return None
 
 
-# --- async-обёртки ---
+def _mark_cell_sold(game: str, row: int, col: int, key_text: str) -> None:
+    """Помечает ячейку проданной: серый фон, зачёркивание, метка ✅. Ключ сохраняется."""
+    try:
+        from gspread.utils import rowcol_to_a1
+
+        gc = _client()
+        ws = gc.open_by_key(config.sheet_id).worksheet(game)
+        a1 = rowcol_to_a1(row, col)
+
+        # сверяем, что в ячейке всё ещё нужный ключ (лист могли подвинуть)
+        current = clean_key(str(ws.acell(a1).value or ""))
+        if current != key_text:
+            cell = ws.find(key_text)  # ищем по значению
+            if cell is None:
+                log.warning("sheets: ключ %s не найден в листе %s для пометки", key_text, game)
+                return
+            a1 = rowcol_to_a1(cell.row, cell.col)
+
+        ws.update_acell(a1, key_text + SOLD_MARK)
+        ws.format(a1, {
+            "backgroundColor": {"red": 0.80, "green": 0.80, "blue": 0.80},
+            "textFormat": {"strikethrough": True,
+                           "foregroundColor": {"red": 0.4, "green": 0.4, "blue": 0.4}},
+        })
+    except Exception as e:  # noqa: BLE001 — пометка не должна ломать выдачу ключа
+        log.warning("sheets: не удалось пометить ячейку проданной: %r", e)
+
+
+def _confirm_sync(order_label: str, product_id_str: str, buyer: str) -> str | None:
+    """Оплата подтверждена: помечаем ключ sold (БД + лист) и возвращаем его."""
+    if not config.sheets_enabled:
+        return None
+
+    rec = orders._inv_confirm(order_label)
+    if rec:
+        _mark_cell_sold(rec["game"], rec["row"], rec["col"], rec["key_text"])
+        return rec["key_text"]
+
+    # Брони нет (истекла к моменту оплаты) — пробуем выдать свежий ключ тарифа.
+    parsed = parse_product_id(product_id_str)
+    if not parsed:
+        return None
+    game, qty = parsed
+    cells = _scan_sheet()
+    orders._inv_expire()
+    blocked = orders._inv_blocked()
+    for c in sorted((c for c in cells if c.game == game and c.qty == qty),
+                    key=lambda c: c.row):
+        if (c.game, c.key_text) in blocked:
+            continue
+        if orders._inv_mark_sold_direct(c.game, c.key_text, c.qty, c.price,
+                                        c.row, c.col, buyer, order_label):
+            _mark_cell_sold(c.game, c.row, c.col, c.key_text)
+            return c.key_text
+        blocked.add((c.game, c.key_text))
+    return None
+
+
+# ---------- async-обёртки (gspread синхронный) ----------
 async def get_catalog() -> list[Product]:
     return await asyncio.to_thread(_catalog_sync)
 
 
-async def get_product(product_id: str) -> Product | None:
+async def get_product(pid: str) -> Product | None:
     for p in await get_catalog():
-        if p.id == product_id:
+        if p.id == pid:
             return p
     return None
 
 
-async def reserve_key(product_title: str, buyer: str) -> str | None:
-    async with _key_lock:
-        return await asyncio.to_thread(_reserve_sync, product_title, buyer)
+async def reserve_for_order(pid: str, order_label: str, buyer: str) -> str | None:
+    """Бронирует ключ под заказ при нажатии «Купить». None — товар закончился."""
+    parsed = parse_product_id(pid)
+    if not parsed:
+        return None
+    game, qty = parsed
+    async with _reserve_lock:
+        return await asyncio.to_thread(_reserve_sync, game, qty, order_label, buyer)
+
+
+async def confirm_sale(order_label: str, pid: str, buyer: str) -> str | None:
+    """Подтверждает продажу после оплаты: ключ -> sold, ячейка помечается."""
+    async with _reserve_lock:
+        return await asyncio.to_thread(_confirm_sync, order_label, pid, buyer)
+
+
+async def release_order(order_label: str) -> None:
+    """Снимает бронь (если заказ отменён/не оплачен принудительно)."""
+    await orders.inv_release(order_label)
