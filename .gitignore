@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+service_account.json
+data/
+
+# одноразовые диагностические/деплой-скрипты (содержат секреты/captured payloads)
+deploy/*.sh
+deploy/*.py

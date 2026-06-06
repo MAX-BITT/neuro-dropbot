@@ -1,0 +1,7 @@
+aiogram>=3.13,<4
+aiohttp>=3.10
+python-dotenv>=1.0
+gspread>=6.1
+google-auth>=2.34
+requests>=2.32
+beautifulsoup4>=4.12
