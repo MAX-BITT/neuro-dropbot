@@ -213,6 +213,7 @@ async def cb_noop(c: CallbackQuery):
 @dp.callback_query(F.data == "support")
 async def cb_support(c: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Написать в поддержку", url="https://t.me/AnnA_Esq")],
         [InlineKeyboardButton(text="⬅️ Меню", callback_data="menu")]])
     await _safe_edit(c, SUPPORT_TEXT, kb)
     await c.answer()
