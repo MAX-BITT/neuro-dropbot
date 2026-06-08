@@ -132,6 +132,16 @@ def _inv_blocked() -> set[tuple[str, str]]:
     return {(r["game"], r["key_text"]) for r in rows}
 
 
+def _inv_status_map() -> dict[tuple[str, str], str]:
+    """{(game, key_text): 'reserved'|'sold'} по всем занятым ключам.
+
+    Для синхронизации цветов ячеек в листе. Вызывать после _inv_expire().
+    """
+    with _connect() as c:
+        rows = c.execute("SELECT game, key_text, status FROM inventory_keys").fetchall()
+    return {(r["game"], r["key_text"]): r["status"] for r in rows}
+
+
 def _inv_reserve(game: str, key_text: str, qty: int, price: int,
                  row: int, col: int, buyer: str, order_label: str,
                  reserved_until: str) -> bool:
@@ -229,6 +239,10 @@ async def inv_expire() -> int:
 
 async def inv_blocked() -> set[tuple[str, str]]:
     return await asyncio.to_thread(_inv_blocked)
+
+
+async def inv_status_map() -> dict[tuple[str, str], str]:
+    return await asyncio.to_thread(_inv_status_map)
 
 
 async def inv_reserve(game, key_text, qty, price, row, col, buyer,

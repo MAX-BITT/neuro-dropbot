@@ -341,7 +341,115 @@ def _confirm_sync(order_label: str, product_id_str: str, buyer: str) -> str | No
     return None
 
 
+# ---------- синхронизация цветов ячеек с БД (бронь / продажа) ----------
+# Формат ячейки по статусу ключа.
+_FMT_SOLD = {
+    "backgroundColor": {"red": 0.80, "green": 0.80, "blue": 0.80},   # серый
+    "textFormat": {"strikethrough": True,
+                   "foregroundColor": {"red": 0.4, "green": 0.4, "blue": 0.4}},
+}
+_FMT_RESERVED = {
+    "backgroundColor": {"red": 1.0, "green": 0.90, "blue": 0.40},    # янтарный — бронь
+    "textFormat": {"strikethrough": False,
+                   "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0}},
+}
+_FMT_FREE = {
+    "backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},      # белый — свободно
+    "textFormat": {"strikethrough": False,
+                   "foregroundColor": {"red": 0.0, "green": 0.0, "blue": 0.0}},
+}
+
+# Последняя применённая «сигнатура» состояния каждого листа — чтобы не дёргать
+# API, когда с прошлой синхронизации ничего не изменилось.
+_marks_sig: dict[str, str] = {}
+# Защита от параллельных запусков синхронизации.
+_sync_running = False
+
+
+def _sync_marks_sync(force: bool = False) -> None:
+    """Приводит цвета ячеек листа в соответствие с БД.
+
+    Бронь — янтарный фон, продано — серый+зачёркнуто+✅, свободно — белый.
+    Идемпотентно: трогает только ячейки-ключи priced-колонок. Освободившиеся
+    (истёкшая бронь / отмена) возвращаются к белому, метка ✅ снимается.
+    """
+    if not config.sheets_writable:
+        return
+    from gspread.utils import rowcol_to_a1
+
+    orders._inv_expire()                  # снять просроченные брони
+    status = orders._inv_status_map()     # {(game, key_text): 'reserved'|'sold'}
+    mark = SOLD_MARK.strip()
+
+    gc = _client()
+    sh = gc.open_by_key(config.sheet_id)
+    skip = set(config.sheet_skip)
+    for ws in sh.worksheets():
+        if ws.title in skip:
+            continue
+        game = ws.title
+        values = ws.get_all_values()
+        cells = extract_cells(game, values)
+        if not cells:
+            continue
+
+        plan = [(c.row, c.col, status.get((game, c.key_text), "free"), c.key_text)
+                for c in cells]
+        sig = repr(sorted((r, col, st) for r, col, st, _ in plan))
+        if not force and _marks_sig.get(game) == sig:
+            continue
+
+        fmt_batch: list[dict] = []
+        val_batch: list[dict] = []
+        for row, col, st, key_text in plan:
+            a1 = rowcol_to_a1(row, col)
+            raw = ""
+            if row - 1 < len(values) and col - 1 < len(values[row - 1]):
+                raw = str(values[row - 1][col - 1])
+            has_mark = raw.strip().endswith(mark)
+            if st == "sold":
+                fmt_batch.append({"range": a1, "format": _FMT_SOLD})
+                if not has_mark:                         # дописать ✅ к проданному
+                    val_batch.append({"range": a1, "values": [[key_text + SOLD_MARK]]})
+            elif st == "reserved":
+                fmt_batch.append({"range": a1, "format": _FMT_RESERVED})
+                if has_mark:                             # бронь временна — снять ✅
+                    val_batch.append({"range": a1, "values": [[key_text]]})
+            else:  # free
+                fmt_batch.append({"range": a1, "format": _FMT_FREE})
+                if has_mark:
+                    val_batch.append({"range": a1, "values": [[key_text]]})
+
+        if fmt_batch:
+            ws.batch_format(fmt_batch)
+        if val_batch:
+            ws.batch_update(val_batch)
+        _marks_sig[game] = sig
+
+
 # ---------- async-обёртки (gspread синхронный) ----------
+async def sync_marks(force: bool = False) -> None:
+    """Синхронизирует цвета ячеек с БД (бронь/продажа). Без работы, если нет прав записи."""
+    global _sync_running
+    if not config.sheets_writable or (_sync_running and not force):
+        return
+    _sync_running = True
+    try:
+        await asyncio.to_thread(_sync_marks_sync, force)
+    finally:
+        _sync_running = False
+
+
+def request_sync() -> None:
+    """Запустить синхронизацию пометок в фоне, не блокируя текущий хэндлер."""
+    if not config.sheets_writable:
+        return
+    try:
+        asyncio.get_running_loop().create_task(sync_marks())
+    except RuntimeError:
+        pass  # нет работающего loop — подхватит фоновый цикл
+
+
 async def get_catalog() -> list[Product]:
     return await asyncio.to_thread(_catalog_sync)
 

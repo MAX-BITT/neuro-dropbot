@@ -48,6 +48,8 @@ class Config:
     reserve_ttl_min: int = int(os.getenv("RESERVE_TTL_MIN", "15"))
     # Сколько секунд кэшировать прочитанную таблицу (чтобы не дёргать её на каждый клик)
     sheet_cache_sec: int = int(os.getenv("SHEET_CACHE_SEC", "20"))
+    # Как часто фоном синхронизировать цвета ячеек с БД (бронь/продажа), секунды
+    sheet_sync_sec: int = int(os.getenv("SHEET_SYNC_SEC", "30"))
 
     # --- Хранилище заказов ---
     db_path: str = os.getenv("DB_PATH", "/opt/neuro-dropbot/data/orders.db")

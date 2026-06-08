@@ -79,6 +79,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
     # Подтверждаем продажу забронированного ключа: помечаем sold в БД и в листе.
     key = await sheets.confirm_sale(label, order["product_id"], buyer)
     await orders.mark_issued(label, key or "", operation_id)
+    sheets.request_sync()   # отметить проданную ячейку (серый+✅) в листе
     if key:
         await bot.send_message(
             order["user_id"],

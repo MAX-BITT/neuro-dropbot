@@ -288,6 +288,7 @@ async def cb_buy(c: CallbackQuery):
         text, kb = await tiers_view(p.game, 0)
         await _safe_edit(c, text, kb)
         return
+    sheets.request_sync()   # подсветить забронированную ячейку в листе
 
     pay_url = ym.build_quickpay_url(
         label=label,
@@ -322,6 +323,7 @@ async def cb_cancel(c: CallbackQuery):
 
     await sheets.release_order(label)               # снять бронь -> ключ снова свободен
     await orders.set_status(label, "cancelled")
+    sheets.request_sync()                           # вернуть ячейку к «свободно» в листе
 
     parsed = sheets.parse_product_id(order["product_id"])
     if parsed:
@@ -333,6 +335,16 @@ async def cb_cancel(c: CallbackQuery):
 
 
 # ---------- запуск ----------
+async def _sheet_sync_loop():
+    """Фоном держит цвета ячеек в листе синхронными с БД (бронь/продажа)."""
+    while True:
+        try:
+            await sheets.sync_marks()
+        except Exception as e:  # noqa: BLE001 — синк не должен ронять бота
+            log.warning("sheet sync loop: %r", e)
+        await asyncio.sleep(config.sheet_sync_sec)
+
+
 async def main():
     if not config.bot_token or config.bot_token.startswith("000000"):
         raise SystemExit("BOT_TOKEN не задан в .env")
@@ -349,6 +361,9 @@ async def main():
     log.info("Bot starting. ym_enabled=%s sheets_read=%s sheets_write=%s webhook_url=%s",
              config.ym_enabled, config.sheets_readable, config.sheets_writable,
              config.webhook_url or "(no PUBLIC_BASE_URL)")
+
+    if config.sheets_writable:
+        asyncio.create_task(_sheet_sync_loop())
 
     try:
         await dp.start_polling(bot)
