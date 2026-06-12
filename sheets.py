@@ -48,6 +48,7 @@ class Product:
     stock: int = 0
     game: str = ""
     qty: int = 0
+    unit: str = ""   # суффикс номинала для показа, например '$'
 
 
 @dataclass
@@ -58,18 +59,26 @@ class KeyCell:
     row: int         # 1-based, как в Google Sheets
     col: int         # 1-based
     key_text: str
+    unit: str = ""   # суффикс номинала для показа, например '$'
 
 
 # ---------- разбор таблицы (чистые функции, тестируются офлайн) ----------
-def parse_header(header: str) -> tuple[int, int] | None:
-    """'100 100' -> (qty=100, price=100). Без второго числа -> None (тариф без цены)."""
+def parse_header(header: str) -> tuple[int, int, str] | None:
+    """'100 100' -> (100, 100, ''). '2$ 192' -> (2, 192, '$').
+
+    Первое число — номинал, второе — цена в рублях. В номинале допускается
+    нечисловой суффикс-единица (например '$'); он сохраняется для показа.
+    Колонка без второго числа -> None (тариф без цены не продаётся).
+    """
     parts = header.strip().split()
     if len(parts) < 2:
         return None
-    try:
-        return int(parts[0]), int(parts[1])
-    except ValueError:
+    qty_digits = re.sub(r"[^0-9]", "", parts[0])
+    price_digits = re.sub(r"[^0-9]", "", parts[1])
+    if not qty_digits or not price_digits:
         return None
+    unit = re.sub(r"[0-9]", "", parts[0]).strip()
+    return int(qty_digits), int(price_digits), unit
 
 
 def clean_key(raw: str) -> str:
@@ -93,7 +102,7 @@ def extract_cells(game: str, values: list[list[str]]) -> list[KeyCell]:
     if not values:
         return []
     header = values[0]
-    tiers: dict[int, tuple[int, int]] = {}
+    tiers: dict[int, tuple[int, int, str]] = {}
     for col_idx, h in enumerate(header):
         parsed = parse_header(str(h))
         if parsed:
@@ -102,14 +111,15 @@ def extract_cells(game: str, values: list[list[str]]) -> list[KeyCell]:
     cells: list[KeyCell] = []
     for r in range(1, len(values)):
         row = values[r]
-        for col_idx, (qty, price) in tiers.items():
+        for col_idx, (qty, price, unit) in tiers.items():
             if col_idx >= len(row):
                 continue
             key = clean_key(str(row[col_idx]))
             if not key or not _looks_like_key(key):
                 continue
             cells.append(KeyCell(game=game, qty=qty, price=price,
-                                 row=r + 1, col=col_idx + 1, key_text=key))
+                                 row=r + 1, col=col_idx + 1, key_text=key,
+                                 unit=unit))
     return cells
 
 
@@ -214,27 +224,28 @@ def _build_catalog(cells: list[KeyCell]) -> list[Product]:
     orders._inv_expire()              # снять просроченные брони
     blocked = orders._inv_blocked()   # {(game, key_text)} занятых ключей
 
-    # агрегируем свободные по (game, qty) -> [price, count]
-    agg: dict[tuple[str, int], list[int]] = {}
+    # агрегируем свободные по (game, qty) -> [price, count, unit]
+    agg: dict[tuple[str, int], list] = {}
     for c in cells:
         if (c.game, c.key_text) in blocked:
             continue
         key = (c.game, c.qty)
         if key not in agg:
-            agg[key] = [c.price, 0]
+            agg[key] = [c.price, 0, c.unit]
         agg[key][1] += 1
 
     products: list[Product] = []
-    for (game, qty), (price, stock) in sorted(agg.items(), key=lambda x: (x[0][0], x[0][1])):
+    for (game, qty), (price, stock, unit) in sorted(agg.items(), key=lambda x: (x[0][0], x[0][1])):
         products.append(Product(
             id=product_id(game, qty),
-            title=f"{game} — {qty}",
-            description=f"{qty} ед. игровой валюты {game}.",
+            title=f"{game} — {qty}{unit}",
+            description=f"{qty}{unit} ед. игровой валюты {game}.",
             price=price,
             image_url="",
             stock=stock,
             game=game,
             qty=qty,
+            unit=unit,
         ))
     return products
 

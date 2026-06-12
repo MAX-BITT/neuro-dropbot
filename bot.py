@@ -140,7 +140,7 @@ async def tiers_view(game: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
     rows = []
     for p in tiers[off:off + TIERS_PER_PAGE]:
         rows.append([InlineKeyboardButton(
-            text=f"{p.qty} — {p.price}₽ · {p.stock} шт.", callback_data=f"p:{p.id}")])
+            text=f"{p.qty}{p.unit} — {p.price}₽ · {p.stock} шт.", callback_data=f"p:{p.id}")])
     nav = []
     if page > 0:
         nav.append(("◀️", f"t:{page - 1}:{game}"))
